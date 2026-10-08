@@ -849,132 +849,142 @@ function deleteAllInCategory() {
   renderAdminCategories();
 }
 
-// ============ BULK UPLOAD ============
+
+// ============ BULK UPLOAD (УЛУЧШЕННАЯ ВЕРСИЯ) ============
+
+// Более надежный парсер URL
 function parseUrls(text) {
-  // Split by newlines, commas, semicolons, tabs, spaces
-  const tokens = text.split(/[\n\r,;\t]+/).map(s => s.trim()).filter(Boolean);
-  // Also split by spaces if token looks like URL
-  const result = [];
-  for (const token of tokens) {
-    if (token.includes(' ') && !token.startsWith('http')) {
-      token.split(/\s+/).forEach(sub => { if (sub) result.push(sub); });
-    } else {
-      result.push(token);
-    }
-  }
-  return result;
-}
-function isValidUrl(str) {
-  try {
-    const u = new URL(str);
-    return u.protocol === 'http:' || u.protocol === 'https:';
-  } catch { return false; }
-}
-function analyzeBulkUrls() {
-  const text = document.getElementById('bulkUrlsInput').value;
-  const urls = parseUrls(text);
-  const valid = urls.filter(isValidUrl);
-  const invalid = urls.length - valid.length;
-  document.getElementById('bulkStats').style.display = 'flex';
-  document.getElementById('bulkTotal').textContent = urls.length;
-  document.getElementById('bulkValid').textContent = valid.length;
-  document.getElementById('bulkInvalid').textContent = invalid;
-}
-function clearBulkInput() {
-  document.getElementById('bulkUrlsInput').value = '';
-  document.getElementById('bulkStats').style.display = 'none';
-  document.getElementById('bulkProgress').classList.remove('active');
-  document.getElementById('bulkProgressText').style.display = 'none';
-}
-function loadFromFile(event) {
-  const file = event.target.files[0];
-  if (!file) return;
-  const reader = new FileReader();
-  reader.onload = (e) => {
-    const content = e.target.result;
-    const current = document.getElementById('bulkUrlsInput').value;
-    document.getElementById('bulkUrlsInput').value = current ? current + '\n' + content : content;
-    analyzeBulkUrls();
-  };
-  reader.readAsText(file);
-  event.target.value = '';
-}
-function addBulkImages() {
-  const catId = document.getElementById('imgCategorySelect').value;
-  if (!catId) return alert('Выберите категорию!');
-  const text = document.getElementById('bulkUrlsInput').value;
-  const urls = parseUrls(text).filter(isValidUrl);
-  if (urls.length === 0) return alert('Нет валидных ссылок для добавления!');
-  
-  // Remove duplicates within input
-  const uniqueUrls = [...new Set(urls)];
-  
-  if (uniqueUrls.length > 100) {
-    if (!confirm(`Будет добавлено ${uniqueUrls.length} изображений. Продолжить?`)) return;
-  }
-  
-  const progressBar = document.getElementById('bulkProgress');
-  const progressFill = document.getElementById('bulkProgressFill');
-  const progressText = document.getElementById('bulkProgressText');
-  progressBar.classList.add('active');
-  progressText.style.display = 'block';
-  
-  // Check existing URLs to avoid duplicates
-  const existing = new Set(getImages().filter(i => i.categoryId === catId).map(i => i.url));
-  const toAdd = uniqueUrls.filter(u => !existing.has(u));
-  
-  if (toAdd.length === 0) {
-    progressText.textContent = `Все ${uniqueUrls.length} ссылок уже существуют в категории`;
-    progressFill.style.width = '100%';
-    setTimeout(() => {
-      progressBar.classList.remove('active');
-      progressText.style.display = 'none';
-    }, 3000);
-    return;
-  }
-  
-  // Add in chunks to avoid UI freeze
-  const CHUNK = 50;
-  let added = 0;
-  const total = toAdd.length;
-  const currentImgs = getImages();
-  
-  function addChunk() {
-    const chunk = toAdd.slice(added, added + CHUNK);
-    for (const url of chunk) {
-      currentImgs.push({
-        id: Date.now().toString() + Math.random().toString(36).slice(2, 9),
-        categoryId: catId,
-        url
-      });
-    }
-    added += chunk.length;
-    const pct = Math.round((added / total) * 100);
-    progressFill.style.width = pct + '%';
-    progressText.textContent = `Добавлено ${added} из ${total} (${pct}%)`;
-    
-    if (added < total) {
-      // Save intermediate state
-      setImages(currentImgs.slice());
-      requestAnimationFrame(addChunk);
-    } else {
-      setImages(currentImgs);
-      progressText.textContent = `✅ Готово! Добавлено ${total} новых изображений (${uniqueUrls.length - total} дубликатов пропущено)`;
-      setTimeout(() => {
-        progressBar.classList.remove('active');
-        progressText.style.display = 'none';
-        progressFill.style.width = '0%';
-      }, 4000);
-      document.getElementById('bulkUrlsInput').value = '';
-      document.getElementById('bulkStats').style.display = 'none';
-      state.adminPage = 1;
-      renderAdminImages();
-      renderAdminCategories();
-    }
-  }
-  requestAnimationFrame(addChunk);
+    if (!text) return [];
+    // Ищем все подстроки, начинающиеся с http:// или https:// до первого пробела/запятой/конца строки
+    const regex = /https?:\/\/[^\s,;"'<>]+/gi;
+    const matches = text.match(regex);
+    return matches ? [...new Set(matches)] : []; // Удаляем дубликаты сразу
 }
 
+function isValidUrl(str) {
+    try {
+        const u = new URL(str);
+        return u.protocol === 'http:' || u.protocol === 'https:';
+    } catch { return false; }
+}
+
+function analyzeBulkUrls() {
+    const text = document.getElementById('bulkUrlsInput').value;
+    const urls = parseUrls(text);
+    
+    // Показываем статистику
+    document.getElementById('bulkStats').style.display = 'flex';
+    document.getElementById('bulkTotal').textContent = urls.length;
+    
+    // Проверка на дубликаты в существующей базе
+    const catId = document.getElementById('imgCategorySelect').value;
+    const existingUrls = new Set(getImages().filter(i => i.categoryId === catId).map(i => i.url));
+    
+    let newCount = 0;
+    let dupCount = 0;
+    
+    urls.forEach(url => {
+        if (existingUrls.has(url)) dupCount++;
+        else newCount++;
+    });
+
+    document.getElementById('bulkValid').textContent = newCount;
+    document.getElementById('bulkInvalid').textContent = dupCount; // Здесь считаем дубли как "не новые"
+    
+    if (urls.length === 0) {
+        alert('Ссылки не найдены! Проверьте формат ввода.');
+    }
+}
+
+function addBulkImages() {
+    const catId = document.getElementById('imgCategorySelect').value;
+    if (!catId) return alert('Выберите категорию!');
+    
+    const text = document.getElementById('bulkUrlsInput').value;
+    const allUrls = parseUrls(text);
+    
+    if (allUrls.length === 0) return alert('Нет валидных ссылок!');
+    
+    // Фильтруем уже существующие
+    const existingUrls = new Set(getImages().filter(i => i.categoryId === catId).map(i => i.url));
+    const toAdd = allUrls.filter(url => !existingUrls.has(url));
+    
+    if (toAdd.length === 0) {
+        alert('Все эти ссылки уже есть в выбранной категории!');
+        return;
+    }
+    
+    if (toAdd.length > 1000) {
+        if (!confirm(`Вы собираетесь добавить ${toAdd.length} изображений. Это может занять время. Продолжить?`)) return;
+    }
+    
+    // UI обновления
+    const progressBar = document.getElementById('bulkProgress');
+    const progressFill = document.getElementById('bulkProgressFill');
+    const progressText = document.getElementById('bulkProgressText');
+    
+    progressBar.classList.add('active');
+    progressText.style.display = 'block';
+    progressText.textContent = `Подготовка к добавлению ${toAdd.length} изображений...`;
+    
+    // Асинхронное добавление чанками
+    const CHUNK_SIZE = 20; // Меньше чанк для плавности
+    let added = 0;
+    const currentImgs = getImages();
+    
+    function processChunk() {
+        const chunk = toAdd.slice(added, added + CHUNK_SIZE);
+        
+        for (const url of chunk) {
+            currentImgs.push({
+                id: Date.now().toString(36) + Math.random().toString(36).substr(2, 5),
+                categoryId: catId,
+                url: url
+            });
+        }
+        
+        added += chunk.length;
+        const pct = Math.round((added / toAdd.length) * 100);
+        progressFill.style.width = pct + '%';
+        progressText.textContent = `Добавлено: ${added} из ${toAdd.length} (${pct}%)`;
+        
+        // Сохраняем промежуточный результат каждые 100 штук, чтобы не потерять прогресс при крахе
+        if (added % 100 === 0 || added === toAdd.length) {
+            try {
+                setImages(currentImgs);
+            } catch (e) {
+                alert('Ошибка сохранения! Возможно, превышен лимит памяти браузера (localStorage). Попробуйте добавить меньше картинок за раз.');
+                progressBar.classList.remove('active');
+                return;
+            }
+        }
+        
+        if (added < toAdd.length) {
+            // Используем setTimeout для неблокирующего выполнения
+            setTimeout(processChunk, 10); 
+        } else {
+            // Завершение
+            progressText.textContent = `✅ Готово! Добавлено ${toAdd.length} новых изображений.`;
+            progressText.style.color = 'var(--success)';
+            
+            setTimeout(() => {
+                progressBar.classList.remove('active');
+                progressText.style.display = 'none';
+                progressText.style.color = '';
+                progressFill.style.width = '0%';
+                
+                // Очищаем поле и обновляем списки
+                document.getElementById('bulkUrlsInput').value = '';
+                document.getElementById('bulkStats').style.display = 'none';
+                state.adminPage = 1;
+                renderAdminImages();
+                renderAdminCategories();
+            }, 3000);
+        }
+    }
+    
+    processChunk();
+}
 // ============ ADMIN IMAGES LIST WITH PAGINATION ============
 function renderAdminImages() {
   const filter = document.getElementById('filterCatSelect').value;
