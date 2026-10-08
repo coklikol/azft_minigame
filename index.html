@@ -378,8 +378,9 @@ body {
     <div class="login-box">
       <h1>🎨 Угадай Картинку</h1>
       <p>Загадывай изображения и угадывай соперника!</p>
+      <div id="syncHint" style="display:none;font-size:12px;color:var(--text2);margin-bottom:10px;line-height:1.4"></div>
       <div class="input-group">
-        <label>Введите ваш ник</label>
+        <label>Введите ваш ник (у друга должен быть другой ник)</label>
         <input type="text" id="nicknameInput" placeholder="Ваш ник..." maxlength="20">
       </div>
       <button class="btn btn-primary" style="width:100%" onclick="login()">Войти в игру</button>
@@ -507,6 +508,7 @@ body {
     <div class="header">
       <div class="logo">🎨 Угадай Картинку</div>
       <div class="user-info">
+        <span id="syncStatus" style="display:none;font-size:12px;color:var(--warning);margin-right:8px"></span>
         <span class="user-badge" id="lobbyNickname"></span>
         <button class="btn btn-outline btn-sm" onclick="logout()">Выйти</button>
       </div>
@@ -534,7 +536,7 @@ body {
         <div style="margin-top:16px;border-top:1px solid var(--border);padding-top:16px">
           <label style="font-size:14px;color:var(--text2);display:block;margin-bottom:8px">Войти по коду комнаты</label>
           <div style="display:flex;gap:8px">
-            <input type="text" id="joinCodeInput" placeholder="Код комнаты" maxlength="6" style="flex:1;padding:10px 14px;background:var(--bg);border:1px solid var(--border);border-radius:10px;color:var(--text);text-transform:uppercase">
+            <input type="text" id="joinCodeInput" placeholder="Код комнаты" maxlength="8" style="flex:1;padding:10px 14px;background:var(--bg);border:1px solid var(--border);border-radius:10px;color:var(--text);text-transform:uppercase">
             <button class="btn btn-success" onclick="joinRoom()">Войти</button>
           </div>
         </div>
@@ -629,6 +631,31 @@ const ADMIN_PASSWORD = 'admin123';
 const CHANNEL_NAME = 'guess_game_channel_v2';
 const PAGE_SIZE_DEFAULT = 50;
 let channel = null;
+
+// ============ SYNC SERVER (Cloudflare Worker) ============
+// Игры синхронизируются между разными устройствами через сервер.
+// 1) Задеплойте worker.js из папки cloudflare-worker (бесплатный тариф Cloudflare Workers).
+// 2) Вставьте сюда URL воркера, например: https://guess-sync.myou.workers.dev
+//    Либо можно временно передавать его в адресной строке: ?server=https://...
+const SYNC_SERVER_URL = 'https://REPLACE-WITH-YOUR-WORKER-URL'; // <-- вставь сюда URL своего Worker
+const SYNC_ROOM_TTL = 6 * 60 * 60 * 1000; // комнаты живут 6 часов без активности
+const SYNC_POLL_MS = 1500;                // как часто просим сервер о новых событиях
+let syncBase = '';
+try {
+  const u = new URLSearchParams(location.search).get('server');
+  if (u && /^https?:\/\//i.test(u)) syncBase = u.replace(/\/+$/, '');
+} catch (e) {}
+if (!syncBase && SYNC_SERVER_URL.indexOf('REPLACE-WITH') === -1 && /^https?:\/\//i.test(SYNC_SERVER_URL)) {
+  syncBase = SYNC_SERVER_URL.replace(/\/+$/, '');
+}
+let syncClientId = Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+let syncLastEventId = '0-0';   // глобальная позиция потока событий
+let syncRoomRev = {};          // { code: revision } — защита от перезаписи более новых данных
+let syncPollTimer = null;
+let syncFetching = false;
+let syncOnline = !!(syncBase && typeof fetch === 'function');
+
+function syncConfigured() { return !!syncBase; }
 let state = {
   nickname: '',
   isAdmin: false,
@@ -642,27 +669,225 @@ let state = {
   adminPageSize: PAGE_SIZE_DEFAULT
 };
 
-// ============ STORAGE ============
-function getCategories() { return JSON.parse(localStorage.getItem('gg_categories') || '[]'); }
-function setCategories(cats) { localStorage.setItem('gg_categories', JSON.stringify(cats)); }
-function getImages() { return JSON.parse(localStorage.getItem('gg_images') || '[]'); }
-function setImages(imgs) { localStorage.setItem('gg_images', JSON.stringify(imgs)); }
-function getRooms() { return JSON.parse(localStorage.getItem('gg_rooms') || '[]'); }
-function setRooms(rooms) { localStorage.setItem('gg_rooms', JSON.stringify(rooms)); }
+// ============ STORAGE (localStorage — кэш + офлайн-режим) ============
+const LS_PREFIX = 'gg_';
+
+function lsGet(key) {
+  try { return localStorage.getItem(LS_PREFIX + key); }
+  catch (e) { return null; }
+}
+function lsSet(key, value) {
+  try { localStorage.setItem(LS_PREFIX + key, value); return true; }
+  catch (e) { return false; }
+}
+function lsRemove(key) {
+  try { localStorage.removeItem(LS_PREFIX + key); } catch (e) {}
+}
+
+function getCategories() { return JSON.parse(lsGet('categories') || '[]'); }
+function setCategories(cats) { lsSet('categories', JSON.stringify(cats)); }
+function getImages() { return JSON.parse(lsGet('images') || '[]'); }
+function setImages(imgs) { lsSet('images', JSON.stringify(imgs)); }
+function getRooms() { return JSON.parse(lsGet('rooms') || '[]'); }
+function setRooms(rooms) { lsSet('rooms', JSON.stringify(rooms)); }
 function getRoom(code) { return getRooms().find(r => r.code === code); }
 function updateRoom(code, updates) {
   const rooms = getRooms();
   const idx = rooms.findIndex(r => r.code === code);
   if (idx >= 0) { rooms[idx] = { ...rooms[idx], ...updates }; setRooms(rooms); }
 }
-function getChatMessages(code) { return JSON.parse(localStorage.getItem('gg_chat_' + code) || '[]'); }
+function getChatMessages(code) { return JSON.parse(lsGet('chat_' + code) || '[]'); }
 function addChatMessage(code, msg) {
   const msgs = getChatMessages(code);
   msgs.push(msg);
-  localStorage.setItem('gg_chat_' + code, JSON.stringify(msgs));
+  lsSet('chat_' + code, JSON.stringify(msgs));
 }
 
-// ============ BROADCAST ============
+// ---- сетевой слой: комнаты и чат живут на сервере, localStorage только кэширует ----
+let netRooms = [];      // актуальный список комнат с сервера
+let netChats = {};      // { roomCode: [messages] }
+let pendingOps = [];    // очередь операций, не отправленных из-за отсутствия сети
+
+function isRemoteRoom(code) { return !!(code && /^R-/.test(code)); }
+function effectiveRooms() {
+  if (!syncOnline) return getRooms();          // сервер недоступен — работаем локально
+  return netRooms.filter(r => Date.now() - (r.updatedAt || 0) < SYNC_ROOM_TTL);
+}
+function effectiveChat(code) {
+  if (isRemoteRoom(code)) return netChats[code] || [];
+  return getChatMessages(code);
+}
+function findRoom(code) {
+  if (syncOnline) return netRooms.find(r => r.code === code) || null;
+  return getRoom(code) || null;
+}
+function saveLocalRoom(room) {
+  const rooms = getRooms();
+  const idx = rooms.findIndex(r => r.code === room.code);
+  if (idx >= 0) rooms[idx] = room; else rooms.push(room);
+  setRooms(rooms);
+}
+
+async function fetchJson(url, opts) {
+  const res = await fetch(url, opts);
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  return res.json();
+}
+
+// Отправить состояние комнаты на сервер. Возвращает true при успехе.
+async function pushRoom(room) {
+  if (!syncConfigured()) return false;
+  if (!isRemoteRoom(room.code)) { saveLocalRoom(room); return true; }
+  room.updatedAt = Date.now();
+  room.rev = (room.rev || 0) + 1;
+  saveLocalRoom(room);                 // кэш на случай обрыва связи
+  syncRoomRev[room.code] = room.rev;
+  try {
+    await fetchJson(syncBase + '/api/room/' + encodeURIComponent(room.code), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(room)
+    });
+    return true;
+  } catch (e) {
+    setSyncStatus('⚠ Нет связи с сервером — играйте в этом браузере или проверьте интернет');
+    return false;
+  }
+}
+
+async function deleteRemoteRoom(code) {
+  if (!isRemoteRoom(code)) return;
+  try {
+    await fetchJson(syncBase + '/api/room/' + encodeURIComponent(code) + '?client=' + syncClientId, { method: 'DELETE' });
+  } catch (e) {}
+}
+
+async function sendRemoteChat(code, msg) {
+  if (!isRemoteRoom(code)) return;
+  try {
+    await fetchJson(syncBase + '/api/chat/' + encodeURIComponent(code) + '?client=' + syncClientId, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(msg)
+    });
+  } catch (e) {
+    if (!netChats[code]) netChats[code] = [];
+    netChats[code].push(msg);   // покажем локально, при следующем полле данные с сервера заменят список
+  }
+}
+
+async function clearRemoteChat(code) {
+  if (!isRemoteRoom(code)) return;
+  try { await fetchJson(syncBase + '/api/chat/' + encodeURIComponent(code) + '?client=' + syncClientId, { method: 'DELETE' }); }
+  catch (e) {}
+}
+
+async function flushPendingOps() {
+  while (pendingOps.length) {
+    const op = pendingOps.shift();
+    try {
+      if (op.t === 'room') await pushRoom(op.room);
+      else if (op.t === 'del') await deleteRemoteRoom(op.code);
+      else if (op.t === 'chat') await sendRemoteChat(op.code, op.msg);
+      else if (op.t === 'clear') await clearRemoteChat(op.code);
+    } catch (e) { pendingOps.unshift(op); return; }
+  }
+}
+
+function queueOp(op) { pendingOps.push(op); flushPendingOps(); }
+
+async function pollSync() {
+  if (!syncConfigured() || syncFetching) return;
+  syncFetching = true;
+  try {
+    const data = await fetchJson(syncBase + '/api/events?since=' + encodeURIComponent(syncLastEventId));
+    syncLastEventId = data.cursor || syncLastEventId;
+    if (Array.isArray(data.rooms)) {
+      for (const r of data.rooms) {
+        const cur = netRooms.find(x => x.code === r.code);
+        if (!cur || (r.rev || 0) >= (cur.rev || 0)) {
+          if (cur) Object.assign(cur, r); else netRooms.push(r);
+          syncRoomRev[r.code] = r.rev || 0;
+          saveLocalRoom(r);
+        }
+      }
+      netRooms = netRooms.filter(x => Date.now() - (x.updatedAt || 0) < SYNC_ROOM_TTL);
+    }
+    if (data.chats) {
+      for (const code in data.chats) {
+        netChats[code] = data.chats[code];
+        lsSet('chat_' + code, JSON.stringify(data.chats[code]));
+      }
+    }
+    if (!syncOnline && netRooms.length >= 0) { syncOnline = true; setSyncStatus(''); }
+    applyRemoteUpdates();
+    flushPendingOps();
+  } catch (e) {
+    if (syncOnline) setSyncStatus('⚠ Нет связи с сервером синхронизации');
+    syncOnline = false;
+  } finally {
+    syncFetching = false;
+  }
+}
+
+// Реакция на новые данные с сервера (комната видна другому игроку без перезагрузки)
+function applyRemoteUpdates() {
+  if (state.currentRoom && isRemoteRoom(state.currentRoom)) {
+    const room = netRooms.find(r => r.code === state.currentRoom);
+    if (!room) {
+      // комнату удалили
+      state.currentRoom = null;
+      showScreen('lobbyScreen');
+      renderRoomList();
+      return;
+    }
+    const wasInGame = document.getElementById('gameScreen').classList.contains('active') ||
+                      document.getElementById('resultsScreen').classList.contains('active');
+    if (document.getElementById('waitingScreen').classList.contains('active')) {
+      if (room.players.length >= 2 && !state.autoStartFired) {
+        state.autoStartFired = true;
+        startGame(room);
+      } else {
+        document.getElementById('waitingTitle').textContent =
+          room.players.length < 2 ? 'Ожидание игрока...' : 'Игрок подключился!';
+        renderWaitingPlayers(room);
+      }
+    } else if (room.gameState && (wasInGame || (room.players.length >= 2 && !document.getElementById('lobbyScreen').classList.contains('active')))) {
+      syncRoomState();
+    }
+    if (document.getElementById('gameScreen').classList.contains('active')) renderChat();
+  }
+  if (document.getElementById('lobbyScreen').classList.contains('active')) renderRoomList();
+}
+
+function startSyncLoop() {
+  if (!syncConfigured()) {
+    syncOnline = false;
+    setSyncStatus('ℹ Синхронизация выключена: укажите SYNC_SERVER_URL (см. README)');
+    return;
+  }
+  if (window.syncTimer) clearInterval(window.syncTimer);
+  pollSync();
+  window.syncTimer = setInterval(pollSync, SYNC_POLL_MS);
+  window.addEventListener('online', () => { syncOnline = true; setSyncStatus(''); pollSync(); });
+  window.addEventListener('offline', () => { syncOnline = false; setSyncStatus('⚠ Офлайн: изменения будут отправлены при появлении сети'); });
+}
+
+function setSyncStatus(text) {
+  const el = document.getElementById('syncStatus');
+  if (!el) return;
+  el.textContent = text || '';
+  el.style.display = text ? 'block' : 'none';
+}
+
+function generateCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let code = '';
+  for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
+  return syncConfigured() ? 'R-' + code : code;
+}
+
+// ============ BROADCAST (работает между вкладками одного браузера) ============
 function initChannel() {
   channel = new BroadcastChannel(CHANNEL_NAME);
   channel.onmessage = (e) => handleBroadcast(e.data.type, e.data.data);
@@ -1060,7 +1285,7 @@ function populateRoomCategories() {
   }).join('');
 }
 function renderRoomList() {
-  const rooms = getRooms();
+  const rooms = effectiveRooms().filter(r => r.players && r.players.some(p => p.nick !== state.nickname));
   const cats = getCategories();
   const list = document.getElementById('roomList');
   const available = rooms.filter(r => r.players.length < 2);
@@ -1079,19 +1304,14 @@ function renderRoomList() {
           <span class="room-tag">${cat ? escapeHtml(cat.name) : '?'}</span>
           <span class="room-tag">${r.size} карт. (${sizeLabel})</span>
           <span class="room-tag">${r.players.length}/2</span>
+          <span class="room-tag" style="text-transform:none">код: ${escapeHtml(r.code)}</span>
         </div>
       </div>
       <button class="btn btn-success btn-sm" onclick="joinRoomByCode('${r.code}')">Войти</button>
     </div>`;
   }).join('');
 }
-function generateCode() {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let code = '';
-  for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
-  return code;
-}
-function createRoom() {
+async function createRoom() {
   const name = document.getElementById('roomNameInput').value.trim();
   const catId = document.getElementById('roomCatSelect').value;
   const size = parseInt(document.getElementById('roomSizeSelect').value);
@@ -1101,36 +1321,64 @@ function createRoom() {
   if (imgs.length < size) {
     return alert(`В категории только ${imgs.length} изображений, а нужно минимум ${size}. Добавьте больше в админке.`);
   }
+  if (syncConfigured() && !syncOnline) {
+    try { await pollSync(); } catch (e) {}
+    if (!syncOnline) return alert('Сервер синхронизации недоступен. Друг не увидит комнату.\nПроверьте SYNC_SERVER_URL и интернет.');
+  }
   const code = generateCode();
   const room = {
     code, name, creator: state.nickname, categoryId: catId, size,
-    players: [{ nick: state.nickname, id: Date.now().toString() }],
-    gameState: null, scores: {}, createdAt: Date.now()
+    players: [{ nick: state.nickname, id: syncClientId + '-' + Date.now().toString(36) }],
+    gameState: null, scores: {}, createdAt: Date.now(), rev: 0
   };
   room.scores[state.nickname] = 0;
-  const rooms = getRooms();
-  rooms.push(room);
-  setRooms(rooms);
   state.currentRoom = code;
+  state.autoStartFired = false;
+  state.gameStartedByMe = false;
+  saveLocalRoom(room);
   broadcast('room_updated', { code });
   showWaitingRoom(room);
+  if (isRemoteRoom(code)) {
+    const ok = await pushRoom(room);
+    if (!ok) queueOp({ t: 'room', room });
+    pollSync();
+  }
 }
 function joinRoom() {
-  const code = document.getElementById('joinCodeInput').value.trim().toUpperCase();
+  let code = document.getElementById('joinCodeInput').value.trim().toUpperCase();
   if (!code) return alert('Введите код!');
+  // допускаем ввод кода без префикса "R-"
+  if (syncConfigured() && /^R-/i.test(code) === false && /^[A-Z0-9]{6}$/.test(code)) code = 'R-' + code;
   joinRoomByCode(code);
 }
-function joinRoomByCode(code) {
-  const room = getRoom(code);
-  if (!room) return alert('Комната не найдена!');
-  if (room.players.length >= 2) return alert('Комната заполнена!');
-  if (room.players.find(p => p.nick === state.nickname)) return alert('Вы уже в этой комнате!');
-  room.players.push({ nick: state.nickname, id: Date.now().toString() });
+async function joinRoomByCode(code) {
+  if (syncConfigured()) await pollSync();
+  const room = findRoom(code);
+  if (!room) return alert('Комната не найдена!' + (syncConfigured() ? '' : ' (синхронизация с сервером выключена — см. README)'));
+  if (room.players.length >= 2 && !room.players.find(p => p.nick === state.nickname)) return alert('Комната заполнена!');
+  if (room.players.find(p => p.nick === state.nickname)) {
+    // этот ник уже в комнате — просто возвращаемся в неё
+    state.currentRoom = code;
+    state.autoStartFired = true;
+    state.gameStartedByMe = !!room.gameState;
+    if (room.gameState) enterGame(room); else showWaitingRoom(room);
+    return;
+  }
+  room.players.push({ nick: state.nickname, id: syncClientId + '-' + Date.now().toString(36) });
   room.scores[state.nickname] = 0;
-  updateRoom(code, room);
   state.currentRoom = code;
+  state.autoStartFired = false;
+  state.gameStartedByMe = false;
+  saveLocalRoom(room);
   broadcast('room_updated', { code });
   showWaitingRoom(room);
+  if (isRemoteRoom(code)) {
+    const ok = await pushRoom(room);
+    if (!ok) queueOp({ t: 'room', room });
+    pollSync();
+  } else {
+    updateRoom(code, room);
+  }
 }
 function showWaitingRoom(room) {
   showScreen('waitingScreen');
@@ -1143,40 +1391,74 @@ function showWaitingRoom(room) {
   } else {
     actions.innerHTML = `<button class="btn btn-outline btn-sm" onclick="leaveRoom()">Покинуть</button>`;
   }
-  if (room.players.length === 2) setTimeout(() => startGame(room), 1000);
+  if (room.players.length === 2 && !state.autoStartFired) {
+    state.autoStartFired = true;
+    setTimeout(() => startGame(findRoom(room.code) || room), 1000);
+  }
 }
 function renderWaitingPlayers(room) {
   const div = document.getElementById('waitingPlayers');
   div.innerHTML = room.players.map(p => `<span class="user-badge" style="margin:4px">${escapeHtml(p.nick)}${p.nick === room.creator ? ' 👑' : ''}</span>`).join('');
 }
-function deleteRoom() {
+async function deleteRoom() {
   if (!confirm('Удалить комнату?')) return;
   const code = state.currentRoom;
-  let rooms = getRooms();
-  rooms = rooms.filter(r => r.code !== code);
-  setRooms(rooms);
-  localStorage.removeItem('gg_chat_' + code);
+  if (isRemoteRoom(code)) {
+    netRooms = netRooms.filter(r => r.code !== code);
+    queueOp({ t: 'del', code });
+    lsRemove('chat_' + code);
+  } else {
+    let rooms = getRooms();
+    rooms = rooms.filter(r => r.code !== code);
+    setRooms(rooms);
+    lsRemove('chat_' + code);
+  }
   broadcast('rooms_deleted', { code });
   state.currentRoom = null;
   showScreen('lobbyScreen');
   renderRoomList();
 }
-function leaveRoom() {
+async function leaveRoom() {
   const code = state.currentRoom;
-  const room = getRoom(code);
+  const room = findRoom(code);
   if (!room) { state.currentRoom = null; showScreen('lobbyScreen'); return; }
   if (room.creator === state.nickname) { deleteRoom(); return; }
   room.players = room.players.filter(p => p.nick !== state.nickname);
   delete room.scores[state.nickname];
-  updateRoom(code, room);
-  broadcast('room_updated', { code });
   state.currentRoom = null;
-  showScreen('lobbyScreen');
-  renderRoomList();
+  if (isRemoteRoom(code)) {
+    saveLocalRoom(room);
+    broadcast('room_updated', { code });
+    showScreen('lobbyScreen');
+    renderRoomList();
+    const ok = await pushRoom(room);
+    if (!ok) queueOp({ t: 'room', room });
+  } else {
+    updateRoom(code, room);
+    broadcast('room_updated', { code });
+    showScreen('lobbyScreen');
+    renderRoomList();
+  }
 }
 
 // ============ GAME ============
+async function saveRoom(room) {
+  if (isRemoteRoom(room.code)) {
+    saveLocalRoom(room);
+    const ok = await pushRoom(room);
+    if (!ok) queueOp({ t: 'room', room });
+  } else {
+    updateRoom(room.code, room);
+  }
+  broadcast('game_state', { roomCode: room.code });
+}
 function startGame(room) {
+  room = findRoom(room.code) || room;
+  if (!room) return;
+  if (room.players.length < 2) return;
+  if (room.gameState && room.gameState.phase !== '') { syncRoomState(); return; }
+  if (state.gameStartedByMe) return;
+  state.gameStartedByMe = true;
   const allImgs = getImages().filter(i => i.categoryId === room.categoryId);
   const shuffled = shuffleArray([...allImgs]).slice(0, room.size);
   const gameState = {
@@ -1185,8 +1467,7 @@ function startGame(room) {
     picks: {}, crossedOut: {}, guesses: {}, roundOver: false
   };
   room.gameState = gameState;
-  updateRoom(room.code, room);
-  broadcast('game_state', { roomCode: room.code });
+  saveRoom(room);
   enterGame(room);
 }
 function enterGame(room) {
@@ -1211,7 +1492,7 @@ function enterGame(room) {
 }
 function renderGameGrid() {
   const grid = document.getElementById('imageGrid');
-  const room = getRoom(state.currentRoom);
+  const room = findRoom(state.currentRoom);
   if (!room) return;
   const size = room.size;
   grid.className = 'image-grid ' + (size === 16 ? 'grid-4x4' : size === 20 ? 'grid-4x5' : 'grid-5x6');
@@ -1251,20 +1532,18 @@ function updatePhaseUI() {
     banner.style.background = 'linear-gradient(135deg, var(--success), #059669)';
   }
 }
-function onImageClick(idx) {
-  const room = getRoom(state.currentRoom);
-  if (!room) return;
+async function onImageClick(idx) {
+  const room = findRoom(state.currentRoom);
+  if (!room || !room.gameState) return;
   const gs = room.gameState;
   if (gs.phase === 'pick') {
     state.mySecret = idx;
     gs.picks[state.nickname] = idx;
-    updateRoom(state.currentRoom, room);
-    broadcast('game_state', { roomCode: state.currentRoom });
+    await saveRoom(room);
     renderGameGrid();
     if (Object.keys(gs.picks).length === 2) {
       gs.phase = 'play';
-      updateRoom(state.currentRoom, room);
-      broadcast('game_state', { roomCode: state.currentRoom });
+      await saveRoom(room);
       state.gamePhase = 'play';
       updatePhaseUI();
       addChatMessage(state.currentRoom, { type: 'system', text: 'Оба игрока загадали картинки! Начинайте задавать вопросы.' });
@@ -1275,24 +1554,23 @@ function onImageClick(idx) {
     if (state.crossedOut.has(idx)) state.crossedOut.delete(idx);
     else state.crossedOut.add(idx);
     gs.crossedOut[state.nickname] = [...state.crossedOut];
-    updateRoom(state.currentRoom, room);
-    broadcast('game_state', { roomCode: state.currentRoom });
+    await saveRoom(room);
     renderGameGrid();
   }
 }
-function makeGuess() {
-  const room = getRoom(state.currentRoom);
-  if (!room) return;
+async function makeGuess() {
+  const room = findRoom(state.currentRoom);
+  if (!room || !room.gameState) return;
   const gs = room.gameState;
   const notCrossed = state.images.map((_, i) => i).filter(i => !state.crossedOut.has(i));
   if (notCrossed.length !== 1) return alert('Должна остаться ровно одна картинка!');
   const guessIdx = notCrossed[0];
   gs.guesses[state.nickname] = guessIdx;
-  updateRoom(state.currentRoom, room);
-  broadcast('game_state', { roomCode: state.currentRoom });
+  await saveRoom(room);
   addChatMessage(state.currentRoom, { type: 'system', text: `${state.nickname} сделал(а) свой выбор!` });
   broadcast('chat_message', { roomCode: state.currentRoom });
-  if (Object.keys(gs.guesses).length === 2) {
+  const opp = room.players.find(p => p.nick !== state.nickname);
+  if (opp && gs.guesses[opp.nick] !== undefined) {
     resolveRound(room);
   } else {
     state.gamePhase = 'result';
@@ -1302,18 +1580,20 @@ function makeGuess() {
     broadcast('chat_message', { roomCode: state.currentRoom });
   }
 }
-function resolveRound(room) {
-  const gs = room.gameState;
+async function resolveRound(room) {
+  const fresh = findRoom(room.code) || room;
+  const gs = fresh.gameState;
+  if (!gs || gs.roundOver) return;
   gs.phase = 'result';
   gs.roundOver = true;
   const results = {};
-  for (const player of room.players) {
+  for (const player of fresh.players) {
     const nick = player.nick;
     const guess = gs.guesses[nick];
-    const opponent = room.players.find(p => p.nick !== nick);
+    const opponent = fresh.players.find(p => p.nick !== nick);
     const opponentSecret = gs.picks[opponent.nick];
     const correct = guess === opponentSecret;
-    if (correct) room.scores[nick] = (room.scores[nick] || 0) + 1;
+    if (correct) fresh.scores[nick] = (fresh.scores[nick] || 0) + 1;
     results[nick] = {
       guessIdx: guess, guessUrl: state.images[guess]?.url,
       secretIdx: opponentSecret, secretUrl: state.images[opponentSecret]?.url,
@@ -1321,9 +1601,8 @@ function resolveRound(room) {
     };
   }
   gs.results = results;
-  updateRoom(state.currentRoom, room);
-  broadcast('game_state', { roomCode: state.currentRoom });
-  showResults(room, results);
+  await saveRoom(fresh);
+  showResults(fresh, results);
 }
 function showResults(room, results) {
   showScreen('resultsScreen');
@@ -1360,8 +1639,8 @@ function showResults(room, results) {
   document.getElementById('score1Value').textContent = room.scores[room.players[0].nick] || 0;
   document.getElementById('score2Value').textContent = room.scores[room.players[1].nick] || 0;
 }
-function playAgain() {
-  const room = getRoom(state.currentRoom);
+async function playAgain() {
+  const room = findRoom(state.currentRoom);
   if (!room) return showScreen('lobbyScreen');
   const allImgs = getImages().filter(i => i.categoryId === room.categoryId);
   const shuffled = shuffleArray([...allImgs]).slice(0, room.size);
@@ -1370,10 +1649,16 @@ function playAgain() {
     images: shuffled.map(img => ({ id: img.id, url: img.url })),
     picks: {}, crossedOut: {}, guesses: {}, roundOver: false
   };
-  updateRoom(state.currentRoom, room);
-  broadcast('game_state', { roomCode: state.currentRoom });
-  localStorage.setItem('gg_chat_' + state.currentRoom, JSON.stringify([]));
-  broadcast('chat_message', { roomCode: state.currentRoom });
+  state.mySecret = null;
+  state.crossedOut = new Set();
+  await saveRoom(room);
+  if (isRemoteRoom(room.code)) {
+    await clearRemoteChat(room.code);
+    netChats[room.code] = [];
+  } else {
+    lsSet('chat_' + room.code, JSON.stringify([]));
+  }
+  broadcast('chat_message', { roomCode: room.code });
   enterGame(room);
 }
 function exitToLobby() {
@@ -1382,7 +1667,7 @@ function exitToLobby() {
   renderRoomList();
 }
 function syncRoomState() {
-  const room = getRoom(state.currentRoom);
+  const room = findRoom(state.currentRoom);
   if (!room || !room.gameState) return;
   const gs = room.gameState;
   state.images = gs.images;
@@ -1402,9 +1687,15 @@ function addChatMessage(roomCode, msg) {
   if (!roomCode) return;
   msg.time = Date.now();
   if (!msg.sender && msg.type !== 'system') msg.sender = state.nickname;
-  const msgs = getChatMessages(roomCode);
-  msgs.push(msg);
-  localStorage.setItem('gg_chat_' + roomCode, JSON.stringify(msgs));
+  if (isRemoteRoom(roomCode)) {
+    if (!netChats[roomCode]) netChats[roomCode] = [];
+    netChats[roomCode].push(msg);
+    queueOp({ t: 'chat', code: roomCode, msg });
+  } else {
+    const msgs = getChatMessages(roomCode);
+    msgs.push(msg);
+    lsSet('chat_' + roomCode, JSON.stringify(msgs));
+  }
 }
 function sendChat() {
   const input = document.getElementById('chatInput');
@@ -1417,7 +1708,7 @@ function sendChat() {
 }
 function renderChat() {
   if (!state.currentRoom) return;
-  const msgs = getChatMessages(state.currentRoom);
+  const msgs = effectiveChat(state.currentRoom);
   const container = document.getElementById('chatMessages');
   container.innerHTML = msgs.map(m => {
     if (m.type === 'system') return `<div class="chat-msg system">${escapeHtml(m.text)}</div>`;
@@ -1462,6 +1753,19 @@ window.addEventListener('load', () => {
     }
     setImages(demoImgs);
   }
+  // подсказка на экране входа о статусе синхронизации
+  const hint = document.getElementById('syncHint');
+  if (hint) {
+    if (syncConfigured()) {
+      hint.style.display = 'block';
+      hint.innerHTML = '🌐 Синхронизация с сервером включена — играть можно на разных устройствах.';
+    } else {
+      hint.style.display = 'block';
+      hint.innerHTML = '⚠️ Синхронизация по сети <b>выключена</b>: комнаты видны только в этом браузере.<br>' +
+        'Чтобы играть с другом на другом устройстве, укажите URL Cloudflare Worker в <code>SYNC_SERVER_URL</code> (см. README).';
+    }
+  }
+  startSyncLoop();
   checkAutoLogin();
 });
 </script>
