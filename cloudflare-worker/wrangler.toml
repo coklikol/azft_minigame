@@ -1,0 +1,8 @@
+name = "guess-sync"
+main = "worker.js"
+compatibility_date = "2026-01-01"
+
+# После `wrangler kv namespace create SYNC` вставьте сюда полученный id:
+[[kv_namespaces]]
+binding = "SYNC"
+id = "ВСТАВЬ_SVOY_ID_СЮДА"
